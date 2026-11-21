@@ -1564,6 +1564,7 @@ fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
     from_clause_has_right_or_full_join: bool,
+    coroutine_would_rerun: bool,
 ) -> FromClauseSubqueryExecutionMode {
     if from_clause_has_right_or_full_join {
         // SQLite does not use a coroutine in a FROM list with RIGHT or FULL JOIN.
@@ -1596,7 +1597,7 @@ fn choose_from_clause_subquery_execution_mode(
             })
         }
         _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
-        _ if from_clause_subquery.requires_table_materialization() => {
+        _ if from_clause_subquery.requires_table_materialization() || coroutine_would_rerun => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
@@ -1651,6 +1652,8 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         allocate_cursors_read_by_lateral_subquery(program, t_ctx, tables, join_order, table_index)?;
+        let coroutine_would_rerun =
+            coroutine_would_rerun_for_outer_rows(tables, join_order, table_index);
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -1658,6 +1661,7 @@ pub fn emit_from_clause_subqueries(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
                     from_clause_has_right_or_full_join,
+                    coroutine_would_rerun,
                 ))
             }
             _ => None,
@@ -1834,6 +1838,44 @@ pub fn emit_from_clause_subqueries(
         }
     }
     Ok(())
+}
+
+/// Whether a coroutine for the FROM-clause subquery at `table_index` may sit
+/// in an inner loop of the join and so run the whole subquery again for each
+/// row of the outer loops. SQLite stores the subquery in a table instead when
+/// an earlier FROM term is a subquery, or when this term or an earlier one is
+/// joined by an outer join or CROSS JOIN, which keeps it after the earlier
+/// terms (rules 1c-i and 1c-ii of `fromClauseTermCanBeCoroutine` in select.c).
+fn coroutine_would_rerun_for_outer_rows(
+    tables: &TableReferences,
+    join_order: &[JoinOrderMember],
+    table_index: usize,
+) -> bool {
+    let joined_tables = tables.joined_tables();
+    let Table::FromClauseSubquery(from_clause_subquery) = &joined_tables[table_index].table else {
+        return false;
+    };
+    // A subquery that reads a row of an outer query has to run again for
+    // each such row, so a table filled once cannot replace it.
+    if plan_has_outer_scope_dependency(&from_clause_subquery.plan) {
+        return false;
+    }
+    // The first table of the join order is read once.
+    if join_order
+        .first()
+        .is_some_and(|member| member.original_idx == table_index)
+    {
+        return false;
+    }
+    joined_tables[..table_index]
+        .iter()
+        .any(|table| matches!(table.table, Table::FromClauseSubquery(_)))
+        || joined_tables[..=table_index].iter().any(|table| {
+            table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer() || join_info.no_reorder)
+        })
 }
 
 fn allocate_cursors_read_by_lateral_subquery(
